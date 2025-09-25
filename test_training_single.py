@@ -1,188 +1,210 @@
+"""End-to-end smoke test for the heterogeneous GNN on dummy data."""
+
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+
 import torch
 from torch_geometric.data import HeteroData
 
 from configs import (
-    ModelConfig,
     DecoderConfig,
+    ModelConfig,
     OptimConfig,
     SchedulerConfig,
     TrainConfig,
 )
 from data import build_loader
-from hetero_gine import HeteroGINE
 from decoders import build_decoder
-from optimizers import (
-    make_optimizer,
-    make_scheduler,
-)
+from hetero_gine import HeteroGINE
+from optimizers import make_optimizer, make_scheduler
 from trainer import Trainer
 
 
+Relation = Tuple[str, str, str]
+
+
+RELATIONS: List[Relation] = [
+    ("building", "x_link", "dline"),
+    ("building", "y_link", "dline"),
+    ("dline", "name_link", "name"),
+]
+
+
 def full_edge_index(n_src: int, n_dst: int) -> torch.Tensor:
-    """Create a full bipartite edge index between n_src and n_dst nodes."""
+    """Create a full bipartite edge index between ``n_src`` and ``n_dst`` nodes."""
+
     src_indices = torch.arange(n_src)
     dst_indices = torch.arange(n_dst)
     src_grid, dst_grid = torch.meshgrid(src_indices, dst_indices, indexing="ij")
     return torch.stack((src_grid.flatten(), dst_grid.flatten()), dim=0)
 
 
-# 1) Test data
-torch.manual_seed(0)
-d = HeteroData()
+def create_dummy_graph() -> HeteroData:
+    """Return a synthetic ``HeteroData`` graph with known positive pairs."""
 
-# 6 buildings, 10 dim-lines, 6 names
-d["building"].x = torch.randn(6, 6)  # 6 buildings, 6-dim features
-d["dline"].x = torch.randn(10, 6)  # 10 dim-lines, 6-dim features
-d["name"].x = torch.randn(6, 6)  # 6 names, 6-dim features
+    torch.manual_seed(0)
+    data = HeteroData()
 
-# All possible node
-all_x_link = full_edge_index(6, 10)
-all_y_link = full_edge_index(6, 10)
-all_name_link = full_edge_index(10, 6)
-d[("building", "x_link", "dline")].edge_index = all_x_link
-d[("building", "y_link", "dline")].edge_index = all_y_link
-d[("dline", "name_link", "name")].edge_index = all_name_link
+    # Random node features
+    data["building"].x = torch.randn(6, 6)
+    data["dline"].x = torch.randn(10, 6)
+    data["name"].x = torch.randn(6, 6)
 
-# Edge attributes
-for relation in [
-    ("building", "x_link", "dline"),
-    ("building", "y_link", "dline"),
-    ("dline", "name_link", "name"),
-]:
-    d[relation].edge_attr = torch.randn(
-        (d[relation[0]].x.size(0) * d[relation[2]].x.size(0)), 2
-    )  # 2-dim edge features
+    # Enumerate every possible edge for the relations of interest
+    data[("building", "x_link", "dline")].edge_index = full_edge_index(6, 10)
+    data[("building", "y_link", "dline")].edge_index = full_edge_index(6, 10)
+    data[("dline", "name_link", "name")].edge_index = full_edge_index(10, 6)
 
-# Positive pairs (ground truth links to learn)
-positive_x = torch.tensor([[0, 1, 2, 3, 4, 0], [5, 8, 6, 9, 7, 8]], dtype=torch.long)
-positive_y = torch.tensor([[0, 1, 2, 3, 4], [0, 3, 1, 4, 2]], dtype=torch.long)
-positive_n = torch.tensor([[0, 1, 3, 5, 8, 9], [1, 4, 3, 0, 2, 5]], dtype=torch.long)
-d["x_link"].y = positive_x
-d["y_link"].y = positive_y
-d["name_link"].y = positive_n
+    # Random edge attributes (2-dim) for every candidate edge
+    for relation in RELATIONS:
+        num_src = data[relation[0]].x.size(0)
+        num_dst = data[relation[2]].x.size(0)
+        data[relation].edge_attr = torch.randn(num_src * num_dst, 2)
 
-# 2) configs
-model_cfg = ModelConfig(node_feature_dimensions={"building": 6, "dline": 6, "name": 6})
-dec_cfg = DecoderConfig(
-    edge_dimensions={
-        ("building", "x_link", "dline"): "mlp",
-        ("building", "y_link", "dline"): "mlp",
-        ("dline", "name_link", "name"): "mlp",
-    },
-    hidden=64,
-)
-optim_cfg = OptimConfig(name="adamw", lr=1e-3, weight_decay=1e-4)
-sched_cfg = SchedulerConfig(name=None)
-train_cfg = TrainConfig(
-    target_loss=1e-3,
-    max_epochs=1000,
-    device="cpu",
-    relations=[
-        ("building", "x_link", "dline"),
-        ("building", "y_link", "dline"),
-        ("dline", "name_link", "name"),
-    ],
-)
-
-# 3) build model
-relations = train_cfg.relations
-node_types = list(d.x_dict.keys())
-edge_dimensions = {rel: d[rel].edge_attr.size(1) for rel in relations}
-model = HeteroGINE(
-    node_types=node_types,
-    relations=relations,
-    node_feature_dimensions=model_cfg.node_feature_dimensions,
-    edge_dimensions=edge_dimensions,
-    hidden_size=model_cfg.hidden_size,
-    n_layers=model_cfg.n_layers,
-    aggregates=model_cfg.aggregates,
-    activation_func=model_cfg.activation_func,
-    use_residual=model_cfg.use_residual,
-)
-
-# 4) decoders
-decoders = {
-    rel: build_decoder(dec_cfg.edge_dimensions[rel], dec_cfg.hidden)
-    for rel in relations
-}
-
-# 5) train
-trainer = Trainer(
-    model,
-    decoders,
-    train_cfg,
-    optim_cfg,
-    sched_cfg,
-    make_optimizer,
-    make_scheduler,
-)
-loader = build_loader([d], batch_size=1, shuffle=True)
-
-# trainer.train(d)
-trainer.train(loader)
-
-
-# 6) inference: best pair per src for x/y/name links
-@torch.no_grad()
-def best_pairs(src_h: torch.Tensor, dst_h: torch.Tensor, decoder):
-    # uses trainer.all_pairs_scores() which enumerates Cartesian product in ij order
-    ei, p = trainer.all_pairs_scores(src_h, dst_h, decoder)
-    n_src, n_dst = src_h.size(0), dst_h.size(0)
-    P = p.view(n_src, n_dst)  # [num_src, num_dst]
-    best_prob, best_dst = P.max(dim=1)  # argmax per source
-    return {int(s): (int(best_dst[s]), float(best_prob[s])) for s in range(n_src)}
-
-
-# with torch.no_grad():
-#     edge_attr_dict = {k: d[k].edge_attr for k in d.edge_types}
-#     h = model(d.x_dict, d.edge_index_dict, edge_attr_dict)
-
-#     rel_x = ("building", "x_link", "dline")
-#     rel_y = ("building", "y_link", "dline")
-#     rel_n = ("dline", "name_link", "name")
-
-#     best_x = best_pairs(h["building"], h["dline"], decoders[rel_x])
-#     best_y = best_pairs(h["building"], h["dline"], decoders[rel_y])
-#     best_n = best_pairs(h["dline"], h["name"], decoders[rel_n])
-
-#     print("Best X-links per building {building -> (dline, prob)}:", best_x)
-#     print("Best Y-links per building {building -> (dline, prob)}:", best_y)
-#     print("Best name-links per dline {dline -> (name, prob)}:", best_n)
-
-with torch.no_grad():
-    batch = next(iter(loader)).to("cpu")
-    edge_attr = (
-        {k: batch[k].edge_attr for k in batch.edge_types}
-        if hasattr(batch[next(iter(batch.edge_types))], "edge_attr")
-        else {}
+    # Ground-truth positive edges that we expect the model to recover
+    data[("building", "x_link", "dline")].pos_edge_index = torch.tensor(
+        [[0, 1, 2, 3, 4, 0], [5, 8, 6, 9, 7, 8]],
+        dtype=torch.long,
     )
-    h = model(batch.x_dict, batch.edge_index_dict, edge_attr)
+    data[("building", "y_link", "dline")].pos_edge_index = torch.tensor(
+        [[0, 1, 2, 3, 4], [0, 3, 1, 4, 2]],
+        dtype=torch.long,
+    )
+    data[("dline", "name_link", "name")].pos_edge_index = torch.tensor(
+        [[0, 1, 3, 5, 8, 9], [1, 4, 3, 0, 2, 5]],
+        dtype=torch.long,
+    )
 
-    rel_x = ("building", "x_link", "dline")
-    rel_y = ("building", "y_link", "dline")
-    rel_n = ("dline", "name_link", "name")
+    return data
 
-    best_x = trainer.best_pairs_batched(
-        h["building"],
-        h["dline"],
-        batch["building"].batch,
-        batch["dline"].batch,
-        decoders[rel_x],
+
+def build_trainer(graph: HeteroData) -> Tuple[Trainer, torch.utils.data.DataLoader]:
+    """Configure the model, decoders, and training components."""
+
+    model_cfg = ModelConfig(
+        node_feature_dimensions={"building": 6, "dline": 6, "name": 6}
     )
-    best_y = trainer.best_pairs_batched(
-        h["building"],
-        h["dline"],
-        batch["building"].batch,
-        batch["dline"].batch,
-        decoders[rel_y],
+    dec_cfg = DecoderConfig(
+        edge_dimensions={
+            ("building", "x_link", "dline"): "mlp",
+            ("building", "y_link", "dline"): "mlp",
+            ("dline", "name_link", "name"): "mlp",
+        },
+        hidden=64,
     )
-    best_n = trainer.best_pairs_batched(
-        h["dline"],
-        h["name"],
-        batch["dline"].batch,
-        batch["name"].batch,
-        decoders[rel_n],
+    optim_cfg = OptimConfig(name="adamw", lr=1e-3, weight_decay=1e-4)
+    sched_cfg = SchedulerConfig(name=None)
+    train_cfg = TrainConfig(
+        target_loss=1e-3,
+        max_epochs=1000,
+        device="cpu",
+        relations=RELATIONS,
     )
-    print("best_x:", best_x)
-    print("best_y:", best_y)
-    print("best_n:", best_n)
+
+    edge_dimensions = {rel: graph[rel].edge_attr.size(1) for rel in RELATIONS}
+    model = HeteroGINE(
+        node_types=list(graph.x_dict.keys()),
+        relations=RELATIONS,
+        node_feature_dimensions=model_cfg.node_feature_dimensions,
+        edge_dimensions=edge_dimensions,
+        hidden_size=model_cfg.hidden_size,
+        n_layers=model_cfg.n_layers,
+        aggregates=model_cfg.aggregates,
+        activation_func=model_cfg.activation_func,
+        use_residual=model_cfg.use_residual,
+    )
+
+    decoders = {
+        rel: build_decoder(dec_cfg.edge_dimensions[rel], dec_cfg.hidden)
+        for rel in RELATIONS
+    }
+
+    trainer = Trainer(
+        model,
+        decoders,
+        train_cfg,
+        optim_cfg,
+        sched_cfg,
+        make_optimizer,
+        make_scheduler,
+    )
+
+    loader = build_loader([graph], batch_size=1, shuffle=True)
+    return trainer, loader
+
+
+def run_training(trainer: Trainer, loader: torch.utils.data.DataLoader) -> None:
+    """Train the model and report the best loss achieved."""
+
+    best_loss = trainer.train(loader)
+    print(f"Training finished with best loss {best_loss:.4e}")
+
+
+def describe_predictions(
+    title: str,
+    predictions: Dict[int, List[Tuple[int, int, float]]],
+    src_label: str,
+    dst_label: str,
+) -> None:
+    """Pretty-print filtered predictions for readability."""
+
+    print(f"\n{title}")
+    if not predictions:
+        print("  (no pairs above the requested threshold)")
+        return
+
+    for graph_id, edges in predictions.items():
+        print(f"  Graph {graph_id}:")
+        for src, dst, prob in edges:
+            print(f"    {src_label} {src} -> {dst_label} {dst}: {prob:.2%}")
+
+
+def run_inference(trainer: Trainer, graph: HeteroData, threshold: float = 0.8) -> None:
+    """Score every candidate edge and list predictions above ``threshold``."""
+
+    eval_loader = build_loader([graph], batch_size=1, shuffle=False)
+    batch = next(iter(eval_loader)).to(trainer.train_cfg.device)
+
+    trainer.model.eval()
+    with torch.no_grad():
+        edge_attr_dict = {
+            relation: batch[relation].edge_attr
+            for relation in trainer.train_cfg.relations
+        }
+        embeddings = trainer.model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
+
+    relation_descriptions = {
+        ("building", "x_link", "dline"): ("building", "dline", "Predicted X-links"),
+        ("building", "y_link", "dline"): ("building", "dline", "Predicted Y-links"),
+        ("dline", "name_link", "name"): ("dline", "name", "Predicted name-links"),
+    }
+
+    for relation in trainer.train_cfg.relations:
+        src_type, _, dst_type = relation
+        src_batch = batch[src_type].batch
+        dst_batch = batch[dst_type].batch
+        decoder = trainer.decoders[str(relation)]
+
+        predictions = trainer.pairs_above_threshold_batched(
+            embeddings[src_type],
+            embeddings[dst_type],
+            src_batch,
+            dst_batch,
+            decoder,
+            threshold,
+        )
+
+        src_label, dst_label, title = relation_descriptions[relation]
+        describe_predictions(title, predictions, src_label, dst_label)
+
+
+def main() -> None:
+    graph = create_dummy_graph()
+    trainer, loader = build_trainer(graph)
+    run_training(trainer, loader)
+    run_inference(trainer, graph, threshold=0.8)
+
+
+if __name__ == "__main__":
+    main()

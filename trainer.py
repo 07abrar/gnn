@@ -2,10 +2,8 @@ import sys
 
 sys.path.insert(0, "/work/hosaka/src")
 
-import numpy as np
 import torch
 from torch.optim import Optimizer
-from torch_geometric.data import HeteroData
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -15,10 +13,7 @@ from configs import (
     TrainConfig,
 )
 from hetero_gine import HeteroGINE
-from losses import (
-    bce_pairwise,
-    chain_regularizer,
-)
+from losses import bce_with_ground_truth, chain_regularizer
 
 # Define a type alias for edge types as tuples of (src_type, edge_type, dst_type)
 edge_type = tuple[str, str, str]
@@ -80,113 +75,6 @@ class Trainer:
         """Helper function to get the decoder for a given relation."""
         return self.decoders[str(relations)]
 
-    def __smooth(self, loss_history: list[float], k: int) -> float:
-        """Helper function to smooth the loss history using a moving average."""
-        if len(loss_history) < k:
-            return sum(loss_history) / len(loss_history)
-        else:
-            return sum(loss_history[-k:]) / k
-
-    def __per_graph_losses(self, batch, node_embeddings):
-        """
-        Compute loss per relation and per blueprint inside a hetero mini-batch.
-        Negatives are sampled only within the same blueprint.
-        """
-        device = torch.device(self.train_cfg.device)
-        total_loss = torch.tensor(0.0, device=device)
-
-        # Get edge indices for each relation
-        # and call bce_pairwise for compute loss on positive and sampled negative
-        for relation in self.train_cfg.relations:
-            src_node_type, _, dst_node_type = relation
-
-            # Gets the batched global edge index for this relation
-            edge_index = batch[relation].edge_index.to(device)
-
-            # Skip if no edges for this relation in the batch
-            if edge_index.numel() == 0:
-                continue
-
-            # Fetches per-endpoint blueprint ids for all edges
-            src_graph_id = batch[src_node_type].batch[edge_index[0]]
-            dst_graph_id = batch[dst_node_type].batch[edge_index[1]]
-
-            # Checks all endpoints of each edge belong to the same blueprint
-            assert torch.equal(src_graph_id, dst_graph_id)
-
-            # Iterates over each blueprint present in this mini-batch for this relation
-            for graph_id in src_graph_id.unique():
-                mask = src_graph_id == graph_id
-                edge_index_graph = edge_index[:, mask]
-
-                # Collects the global node indices of this blueprint for both node types
-                src_local_nodes = torch.where(batch[src_node_type].batch == graph_id)[0]
-                dst_local_nodes = torch.where(batch[dst_node_type].batch == graph_id)[0]
-
-                # Creates global→local maps initialized to −1
-                src_global_to_local = -torch.ones(
-                    batch[src_node_type].num_nodes,
-                    dtype=torch.long,
-                    device=device,
-                )
-                dst_global_to_local = -torch.ones(
-                    batch[dst_node_type].num_nodes,
-                    dtype=torch.long,
-                    device=device,
-                )
-
-                # Fills maps so nodes of this blueprint get local ids [0..n−1]
-                src_global_to_local[src_local_nodes] = torch.arange(
-                    src_local_nodes.numel(), device=device
-                )
-                dst_global_to_local[dst_local_nodes] = torch.arange(
-                    dst_local_nodes.numel(), device=device
-                )
-
-                # Remaps the blueprint’s edges from global ids to local ids
-                local_edge_index = torch.stack(
-                    [
-                        src_global_to_local[edge_index_graph[0]],
-                        dst_global_to_local[edge_index_graph[1]],
-                    ],
-                    dim=0,
-                )
-
-                # Fetches the node embeddings for this blueprint
-                src_node_emb = node_embeddings[src_node_type][src_local_nodes]
-                dst_node_emb = node_embeddings[dst_node_type][dst_local_nodes]
-
-                # Computes link loss with negatives sampled inside this blueprint only
-                relation_loss = bce_pairwise(
-                    self.__dec(relation),
-                    src_node_emb,
-                    dst_node_emb,
-                    local_edge_index,
-                    num_src_nodes=src_local_nodes.numel(),
-                    num_dst_nodes=dst_local_nodes.numel(),
-                )
-
-                # Checks if chain penalty applies and there are edges
-                if relation in self.train_cfg.chain_on and local_edge_index.numel() > 0:
-                    relation_logits = self.__dec(relation)(
-                        src_node_emb, dst_node_emb, local_edge_index
-                    )
-
-                    # Adds weighted chain regularization
-                    relation_loss = (
-                        relation_loss
-                        + self.train_cfg.chain_lambda
-                        * chain_regularizer(
-                            relation_logits,
-                            local_edge_index,
-                            num_src_nodes=src_local_nodes.numel(),
-                        )
-                    )
-
-                # Returns the total loss over all relations and blueprints
-                total_loss = total_loss + relation_loss
-        return total_loss
-
     def train(self, loader: DataLoader):
         # Set reproducibility and device
         torch.manual_seed(self.train_cfg.seed)
@@ -195,66 +83,94 @@ class Trainer:
         for decoder_module in self.decoders.values():
             decoder_module.to(device)
 
-        lost_history = []
         best_loss = float("inf")
-        epoch = 0
-
-        # Record starting loss for percentage calculation and tqdm display
-        initial_loss = 1.0
         target_loss = self.train_cfg.target_loss
-        log_initial = np.log10(initial_loss)
-        log_target = np.log10(target_loss)
-        pbar = tqdm(total=100, desc="Training Progress (%)", unit="%")
+        pbar = tqdm(range(self.train_cfg.max_epochs), desc="Training", unit="epoch")
 
-        # Training loop
-        while epoch < self.train_cfg.max_epochs and best_loss > target_loss:
+        for epoch in pbar:
+            epoch_loss = 0.0
             for batch in loader:
                 batch = batch.to(device)
                 self.model.train()
                 self.opt.zero_grad()
 
-                #  Collect edge attributes and node features from DataLoader batch
                 edge_attr_dict = {
-                    k: batch[k].edge_attr.to(device) for k in batch.edge_types
+                    relation: batch[relation].edge_attr.to(device)
+                    for relation in self.train_cfg.relations
                 }
 
-                # Forward pass through the GNN -> node embeddings
-                x_dict = {k: x.to(device) for k, x in batch.x_dict.items()}
-                edge_index_dict = {
-                    k: ei.to(device) for k, ei in batch.edge_index_dict.items()
+                x_dict = {
+                    node_type: x.to(device) for node_type, x in batch.x_dict.items()
                 }
+                edge_index_dict = {
+                    relation: edge_index.to(device)
+                    for relation, edge_index in batch.edge_index_dict.items()
+                }
+
                 node_embeddings = self.model(x_dict, edge_index_dict, edge_attr_dict)
 
-                total_loss = self.__per_graph_losses(
-                    batch,
-                    node_embeddings,
-                )
+                total_loss = torch.tensor(0.0, device=device)
+                for relation in self.train_cfg.relations:
+                    src_node_type, _, dst_node_type = relation
+                    edge_store = batch[relation]
 
-                # Backprop and optimization step
+                    if not hasattr(edge_store, "pos_edge_index"):
+                        raise AttributeError(
+                            f"Batch for relation {relation} is missing 'pos_edge_index'."
+                        )
+
+                    pos_edge_index = edge_store.pos_edge_index.to(device)
+
+                    relation_loss = bce_with_ground_truth(
+                        self.__dec(relation),
+                        node_embeddings[src_node_type],
+                        node_embeddings[dst_node_type],
+                        edge_store.edge_index,
+                        pos_edge_index,
+                        num_dst_nodes=node_embeddings[dst_node_type].size(0),
+                    )
+
+                    if (
+                        relation in self.train_cfg.chain_on
+                        and edge_store.edge_index.numel() > 0
+                    ):
+                        relation_logits = self.__dec(relation)(
+                            node_embeddings[src_node_type],
+                            node_embeddings[dst_node_type],
+                            edge_store.edge_index,
+                        )
+                        relation_loss = (
+                            relation_loss
+                            + self.train_cfg.chain_lambda
+                            * chain_regularizer(
+                                relation_logits,
+                                edge_store.edge_index,
+                                num_src_nodes=node_embeddings[src_node_type].size(0),
+                            )
+                        )
+
+                    total_loss = total_loss + relation_loss
+
                 total_loss.backward()
                 self.opt.step()
 
-                # Track and smooth the loss
-                lost_history.append(float(total_loss.detach().item()))
-                loss_avg = self.__smooth(lost_history, self.train_cfg.eval_smoothing)
-                best_loss = min(best_loss, loss_avg)
+                epoch_loss += float(total_loss.detach().item())
 
-                # Calculate percentage progress and update tqdm bar
-                log_current = np.log10(loss_avg)
-                p = (log_initial - log_current) / (log_initial - log_target) * 100
-                pbar.n = int(p)
-                pbar.postfix = {"loss": f"{loss_avg:.4e}", "epoch": epoch}
-                pbar.refresh()
+            epoch_loss /= max(len(loader), 1)
+            best_loss = min(best_loss, epoch_loss)
 
-                # Step the scheduler if applicable
-                if self.sched and self.sched.__class__.__name__ != "ReduceLROnPlateau":
+            pbar.set_postfix({"loss": f"{epoch_loss:.4e}", "best": f"{best_loss:.4e}"})
+
+            if self.sched:
+                if self.sched.__class__.__name__ == "ReduceLROnPlateau":
+                    self.sched.step(epoch_loss)
+                else:
                     self.sched.step()
-            if self.sched and self.sched.__class__.__name__ == "ReduceLROnPlateau":
-                self.sched.step(total_loss.detach())
 
-            epoch += 1
+            if best_loss <= target_loss:
+                break
 
-        return total_loss.item()
+        return best_loss
 
     @torch.no_grad()
     def all_pairs_scores_batched(
@@ -307,8 +223,6 @@ class Trainer:
     def best_pairs_batched(
         self,
         src_h: torch.Tensor,
-        dst_h: torch.Tensor,
-        src_batch: torch.Tensor,
         dst_batch: torch.Tensor,
         decoder,
     ):
@@ -334,138 +248,33 @@ class Trainer:
             }
         return result
 
-    """
-    The following train() method is works for a single HeteroData graph
-    """
-    # def train(self, data: HeteroData):
-    #     # Set reproducibility and device
-    #     torch.manual_seed(self.train_cfg.seed)
-    #     device = torch.device(self.train_cfg.device)
-    #     self.model.to(device)
-    #     for decoder_module in self.decoders.values():
-    #         decoder_module.to(device)
+    @torch.no_grad()
+    def pairs_above_threshold_batched(
+        self,
+        src_h: torch.Tensor,
+        dst_h: torch.Tensor,
+        src_batch: torch.Tensor,
+        dst_batch: torch.Tensor,
+        decoder,
+        threshold: float,
+    ):
+        """Return all source/destination pairs whose probability exceeds ``threshold``."""
 
-    #     lost_history = []
-    #     best_loss = float("inf")
-    #     epoch = 0
+        all_pairs = self.all_pairs_scores_batched(
+            src_h, dst_h, src_batch, dst_batch, decoder
+        )
+        filtered: dict[int, list[tuple[int, int, float]]] = {}
 
-    #     # Record starting loss for percentage calculation and tqdm display
-    #     initial_loss = 1.0
-    #     target_loss = self.train_cfg.target_loss
-    #     pbar = tqdm(total=100, desc="Training Progress (%)", unit="%")
+        for graph_id, payload in all_pairs.items():
+            probs = payload["probs"]
+            keep = probs >= threshold
+            if keep.any():
+                local_edge_index = payload["edge_index_local"][:, keep]
+                src_global = payload["src_local_to_global"][local_edge_index[0]]
+                dst_global = payload["dst_local_to_global"][local_edge_index[1]]
+                filtered[graph_id] = [
+                    (int(src.item()), int(dst.item()), float(prob.item()))
+                    for src, dst, prob in zip(src_global, dst_global, probs[keep])
+                ]
 
-    #     # Training loop
-    #     while epoch < self.train_cfg.max_epochs and best_loss > target_loss:
-    #         self.model.train()
-    #         self.opt.zero_grad()
-
-    #         #  Collect edge attributes and node features from HeteroData
-    #         edge_attr_dict = {
-    #             k: data[k].edge_attr.to(device) for k in data.edge_types
-    #         }
-
-    #         # Forward pass through the GNN -> node embeddings
-    #         x_dict = {k: x.to(device) for k, x in data.x_dict.items()}
-    #         edge_index_dict = {
-    #             k: ei.to(device) for k, ei in data.edge_index_dict.items()
-    #         }
-    #         node_embeddings = self.model(
-    #             x_dict,
-    #             edge_index_dict,
-    #             edge_attr_dict,
-    #         )
-
-    #         # Get edge indices for each relation
-    #         # and call bce_pairwise for compute loss on positive and sampled negative edges
-    #         total_loss = torch.tensor(0.0, device=device)
-    #         for relation in self.train_cfg.relations:
-    #             edge_index = data[relation].edge_index.to(device)
-    #             src_type, dst_type = relation[0], relation[2]
-    #             relation_loss = bce_pairwise(
-    #                 self.__dec(relation),
-    #                 node_embeddings[src_type],
-    #                 node_embeddings[dst_type],
-    #                 edge_index,
-    #                 data[src_type].x.size(0),
-    #                 data[dst_type].x.size(0),
-    #             )
-
-    #             # Optionally add chain regularization loss for specified relations
-    #             if relation in self.train_cfg.chain_on:
-    #                 relation_logits = self.__dec(relation)(
-    #                     node_embeddings[src_type],
-    #                     node_embeddings[dst_type],
-    #                     edge_index,
-    #                 )
-    #                 relation_loss = (
-    #                     relation_loss
-    #                     + self.train_cfg.chain_lambda
-    #                     * chain_regularizer(
-    #                         relation_logits,
-    #                         edge_index,
-    #                         data[src_type].x.size(0),
-    #                     )
-    #                 )
-
-    #             # Accumulate loss over all relations
-    #             total_loss = total_loss + relation_loss
-
-    #         # Backprop and optimization step
-    #         total_loss.backward()
-    #         self.opt.step()
-
-    #         # Track and smooth the loss
-    #         lost_history.append(float(total_loss.detach().item()))
-    #         loss_avg = self.__smooth(
-    #             lost_history, self.train_cfg.eval_smoothing
-    #         )
-    #         best_loss = min(best_loss, loss_avg)
-
-    #         # Calculate percentage progress and update tqdm bar
-    #         log_initial = np.log10(initial_loss)
-    #         log_target = np.log10(target_loss)
-    #         log_current = np.log10(loss_avg)
-    #         p = (log_initial - log_current) / (log_initial - log_target) * 100
-    #         pbar.n = p
-    #         pbar.postfix = {"loss": f"{loss_avg:.1e}"}
-    #         pbar.refresh()
-
-    #         # Step the scheduler if applicable
-    #         if (
-    #             self.sched
-    #             and hasattr(self.sched, "step")
-    #             and self.sched.__class__.__name__ != "ReduceLROnPlateau"
-    #         ):
-    #             self.sched.step()
-    #         if (
-    #             self.sched
-    #             and self.sched.__class__.__name__ == "ReduceLROnPlateau"
-    #         ):
-    #             self.sched.step(total_loss.detach())
-
-    #         epoch += 1
-
-    #     return total_loss.item()
-
-    # @torch.no_grad()
-    # def all_pairs_scores(
-    #     self, src_node_embeddings, dst_node_embeddings, edge_decoder
-    # ):
-    #     """
-    #     Returns all-pairs edge scores with sigmoid probabilities
-    #     between every src and dst node using the provided edge decoder.
-    #     """
-    #     src_indices = torch.arange(
-    #         src_node_embeddings.size(0), device=src_node_embeddings.device
-    #     )
-    #     dst_indices = torch.arange(
-    #         dst_node_embeddings.size(0), device=src_node_embeddings.device
-    #     )
-    #     edge_index = torch.stack(
-    #         torch.meshgrid(src_indices, dst_indices, indexing="ij"), dim=0
-    #     ).view(2, -1)
-    #     logits = edge_decoder(
-    #         src_node_embeddings, dst_node_embeddings, edge_index
-    #     )
-    #     edge_probs = torch.sigmoid(logits)
-    #     return edge_index, edge_probs
+        return filtered
