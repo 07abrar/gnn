@@ -6,8 +6,15 @@ from torch_geometric.nn import HeteroConv, GINEConv
 edge_type = tuple[str, str, str]
 
 
-def _act(name: str):
-    return nn.ReLU() if name == "relu" else nn.GELU()
+def _act(name: str) -> nn.Module:
+    """Return the activation module specified by ``name``."""
+
+    normalized = name.lower()
+    if normalized == "relu":
+        return nn.ReLU()
+    if normalized == "gelu":
+        return nn.GELU()
+    raise ValueError(f"Unsupported activation function: {name}")
 
 
 def _mlp(hid: int) -> nn.Sequential:

@@ -132,19 +132,19 @@ class Trainer:
 
                     if (
                         relation in self.train_cfg.chain_on
-                        and edge_store.edge_index.numel() > 0
+                        and pos_edge_index.numel() > 0
                     ):
-                        relation_logits = self.__dec(relation)(
+                        pos_relation_logits = self.__dec(relation)(
                             node_embeddings[src_node_type],
                             node_embeddings[dst_node_type],
-                            edge_store.edge_index,
+                            pos_edge_index,
                         )
                         relation_loss = (
                             relation_loss
                             + self.train_cfg.chain_lambda
                             * chain_regularizer(
-                                relation_logits,
-                                edge_store.edge_index,
+                                pos_relation_logits,
+                                pos_edge_index,
                                 num_src_nodes=node_embeddings[src_node_type].size(0),
                             )
                         )
