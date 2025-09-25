@@ -223,29 +223,35 @@ class Trainer:
     def best_pairs_batched(
         self,
         src_h: torch.Tensor,
+        dst_h: torch.Tensor,
+        src_batch: torch.Tensor,
         dst_batch: torch.Tensor,
         decoder,
     ):
         """
-        Argmax per source within each blueprint. Returns:
-        { graph_id: {src_global: (dst_global, prob)} }
+        Argmax per source within each blueprint.
+        Returns: { graph_id: {src_global: (dst_global, prob)} }
         """
         ap = self.all_pairs_scores_batched(src_h, dst_h, src_batch, dst_batch, decoder)
-        result = {}
+        result: dict[int, dict[int, tuple[int, float]]] = {}
 
         for g, payload in ap.items():
-            probs = payload["probs"]
+            probs = payload["probs"]  # [S*D]
             S = payload["src_local_to_global"].numel()
             D = payload["dst_local_to_global"].numel()
-            P = probs.view(S, D)
+            if S == 0 or D == 0:
+                continue
 
-            best_prob, best_dst_local = P.max(dim=1)
-            src_gl = payload["src_local_to_global"]
-            dst_gl = payload["dst_local_to_global"][best_dst_local]
+            P = probs.view(S, D)  # [S, D]
+            best_prob, best_dst_local = P.max(dim=1)  # [S], [S]
+
+            src_gl = payload["src_local_to_global"]  # [S]
+            dst_gl = payload["dst_local_to_global"][best_dst_local]  # [S]
 
             result[g] = {
                 int(src_gl[i]): (int(dst_gl[i]), float(best_prob[i])) for i in range(S)
             }
+
         return result
 
     @torch.no_grad()
