@@ -2,8 +2,10 @@ import sys
 
 sys.path.insert(0, "/work/hosaka/src")
 
+import numpy as np
 import torch
 from torch.optim import Optimizer
+from torch_geometric.data import HeteroData
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -75,6 +77,13 @@ class Trainer:
         """Helper function to get the decoder for a given relation."""
         return self.decoders[str(relations)]
 
+    def __smooth(self, loss_history: list[float], k: int) -> float:
+        """Helper function to smooth the loss history using a moving average."""
+        if len(loss_history) < k:
+            return sum(loss_history) / len(loss_history)
+        else:
+            return sum(loss_history[-k:]) / k
+
     def train(self, loader: DataLoader):
         # Set reproducibility and device
         torch.manual_seed(self.train_cfg.seed)
@@ -82,21 +91,30 @@ class Trainer:
         self.model.to(device)
         for decoder_module in self.decoders.values():
             decoder_module.to(device)
+            decoder_module.train()
 
+        lost_history = []
         best_loss = float("inf")
-        target_loss = self.train_cfg.target_loss
-        pbar = tqdm(range(self.train_cfg.max_epochs), desc="Training", unit="epoch")
+        epoch = 0
 
-        for epoch in pbar:
-            epoch_loss = 0.0
+        # Record starting loss for percentage calculation and tqdm display
+        initial_loss = 1.0
+        target_loss = self.train_cfg.target_loss
+        log_initial = np.log10(initial_loss)
+        log_target = np.log10(target_loss)
+        pbar = tqdm(total=100, desc="Training Progress (%)", unit="%")
+
+        # Training loop
+        while epoch < self.train_cfg.max_epochs and best_loss > target_loss:
             for batch in loader:
                 batch = batch.to(device)
                 self.model.train()
                 self.opt.zero_grad()
 
+                #  Collect edge attributes and node features from DataLoader batch
                 edge_attr_dict = {
                     relation: batch[relation].edge_attr.to(device)
-                    for relation in self.train_cfg.relations
+                    for relation in batch.edge_types
                 }
 
                 x_dict = {
@@ -107,29 +125,24 @@ class Trainer:
                     for relation, edge_index in batch.edge_index_dict.items()
                 }
 
+                # Forward pass through the GNN to update the node embeddings
                 node_embeddings = self.model(x_dict, edge_index_dict, edge_attr_dict)
 
                 total_loss = torch.tensor(0.0, device=device)
                 for relation in self.train_cfg.relations:
                     src_node_type, _, dst_node_type = relation
-                    edge_store = batch[relation]
-
-                    if not hasattr(edge_store, "pos_edge_index"):
-                        raise AttributeError(
-                            f"Batch for relation {relation} is missing 'pos_edge_index'."
-                        )
-
-                    pos_edge_index = edge_store.pos_edge_index.to(device)
+                    all_edge_index = batch[relation].edge_index
+                    pos_edge_index = batch[relation].y.to(device)
 
                     relation_loss = bce_with_ground_truth(
                         self.__dec(relation),
                         node_embeddings[src_node_type],
                         node_embeddings[dst_node_type],
-                        edge_store.edge_index,
-                        pos_edge_index,
-                        num_dst_nodes=node_embeddings[dst_node_type].size(0),
+                        all_edge_index,
+                        targets=batch[relation].bce_loss_target.to(device),
                     )
 
+                    # Regularization to limit number of links per source node
                     if (
                         relation in self.train_cfg.chain_on
                         and pos_edge_index.numel() > 0
@@ -145,32 +158,39 @@ class Trainer:
                             * chain_regularizer(
                                 pos_relation_logits,
                                 pos_edge_index,
-                                num_src_nodes=node_embeddings[src_node_type].size(0),
+                                node_embeddings[src_node_type].size(0),
                             )
                         )
 
                     total_loss = total_loss + relation_loss
 
+                # Backprop and optimization step
                 total_loss.backward()
                 self.opt.step()
 
-                epoch_loss += float(total_loss.detach().item())
+            epoch += 1
 
-            epoch_loss /= max(len(loader), 1)
-            best_loss = min(best_loss, epoch_loss)
+            # Track and smooth the loss
+            lost_history.append(float(total_loss.detach().item()))
+            loss_avg = self.__smooth(lost_history, self.train_cfg.eval_smoothing)
+            best_loss = min(best_loss, loss_avg)
 
-            pbar.set_postfix({"loss": f"{epoch_loss:.4e}", "best": f"{best_loss:.4e}"})
+            # Calculate percentage progress and update tqdm bar
+            log_current = np.log10(loss_avg)
+            p = (log_initial - log_current) / (log_initial - log_target) * 100
+            pbar.n = int(p)
+            pbar.postfix = {"loss": f"{loss_avg:.4e}", "epoch": epoch}
+            pbar.refresh()
 
-            if self.sched:
-                if self.sched.__class__.__name__ == "ReduceLROnPlateau":
-                    self.sched.step(epoch_loss)
-                else:
-                    self.sched.step()
+            # Step the scheduler if applicable
+            if self.sched and self.sched.__class__.__name__ != "ReduceLROnPlateau":
+                self.sched.step()
+        if self.sched and self.sched.__class__.__name__ == "ReduceLROnPlateau":
+            self.sched.step(total_loss.detach())
 
-            if best_loss <= target_loss:
-                break
+        epoch += 1
 
-        return best_loss
+        return total_loss.item()
 
     @torch.no_grad()
     def all_pairs_scores_batched(
@@ -236,22 +256,18 @@ class Trainer:
         result: dict[int, dict[int, tuple[int, float]]] = {}
 
         for g, payload in ap.items():
-            probs = payload["probs"]  # [S*D]
+            probs = payload["probs"]
             S = payload["src_local_to_global"].numel()
             D = payload["dst_local_to_global"].numel()
-            if S == 0 or D == 0:
-                continue
+            P = probs.view(S, D)
 
-            P = probs.view(S, D)  # [S, D]
-            best_prob, best_dst_local = P.max(dim=1)  # [S], [S]
-
-            src_gl = payload["src_local_to_global"]  # [S]
-            dst_gl = payload["dst_local_to_global"][best_dst_local]  # [S]
+            best_prob, best_dst_local = P.max(dim=1)
+            src_gl = payload["src_local_to_global"]
+            dst_gl = payload["dst_local_to_global"][best_dst_local]
 
             result[g] = {
                 int(src_gl[i]): (int(dst_gl[i]), float(best_prob[i])) for i in range(S)
             }
-
         return result
 
     @torch.no_grad()
@@ -262,7 +278,7 @@ class Trainer:
         src_batch: torch.Tensor,
         dst_batch: torch.Tensor,
         decoder,
-        threshold: float,
+        threshold: float = 0.9,
     ):
         """Return all source/destination pairs whose probability exceeds ``threshold``."""
 

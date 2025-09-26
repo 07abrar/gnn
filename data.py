@@ -22,7 +22,9 @@ class BlueprintDataset(torch.utils.data.Dataset):
         return self.graphs[i]
 
 
-def build_loader(graphs: list[HeteroData], batch_size: int = 4, shuffle: bool = True):
+def build_loader(
+    graphs: list[HeteroData], batch_size: int = 4, shuffle: bool = True
+) -> torch.utils.data.DataLoader:
     """
     A helper function that creates a DataLoader for batching and shuffling graphs from a BlueprintDataset.
     """

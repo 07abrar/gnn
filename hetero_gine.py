@@ -7,7 +7,7 @@ edge_type = tuple[str, str, str]
 
 
 def _act(name: str) -> nn.Module:
-    """Return the activation module specified by ``name``."""
+    """Return the activation module specified by `name`."""
 
     normalized = name.lower()
     if normalized == "relu":
@@ -117,7 +117,6 @@ class HeteroGINE(nn.Module):
             for node_type, features in x_dict.items()
         }
 
-        # TODO Comment out. Maybe not need to make reverse edges/attrs.
         # Augment edges/attrs with reverse relations for message passing.
         full_edge_index_dict, full_edge_attr_dict = self.__add_reverses(
             edge_index_dict, edge_attr_dict
@@ -125,7 +124,6 @@ class HeteroGINE(nn.Module):
 
         for layer_idx, conv in enumerate(self.layers):
 
-            # TODO: GINEConv input all edge_attr and edge_index
             # Update node embeddings by passing through the hidden layer.
             updated_node_embeddings = conv(
                 node_embeddings, full_edge_index_dict, full_edge_attr_dict
