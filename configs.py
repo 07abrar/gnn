@@ -91,6 +91,7 @@ class TrainConfig:
             ("dline", "name_link", "name"),
         ]
     )
+    # Specify which edge relations should use the chain regularizer during training
     chain_on: list[edge_type] = field(
         default_factory=lambda: [
             ("building", "x_link", "dline"),
