@@ -1,11 +1,12 @@
 import sys
+from typing import Callable, Optional, Union
 
 sys.path.insert(0, "/work/hosaka/src")
 
 import numpy as np
 import torch
 from torch.optim import Optimizer
-from torch_geometric.data import HeteroData
+from torch.optim.lr_scheduler import ReduceLROnPlateau, _LRScheduler
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -20,10 +21,22 @@ from losses import bce_with_ground_truth, chain_regularizer
 # Define a type alias for edge types as tuples of (src_type, edge_type, dst_type)
 edge_type = tuple[str, str, str]
 
+# Type alias for scheduler factory functions
+SchedulerFactory = Callable[
+    [
+        Optimizer,
+        Optional[str],
+        int,
+        float,
+        int,
+    ],
+    Optional[Union[_LRScheduler, ReduceLROnPlateau]],
+]
+
 
 class Trainer:
     """
-    implements the training engine for the heterogeneous GNN model.
+    Implements the training engine for the heterogeneous GNN model.
     Initializes model, decoders, optimizer, and scheduler based on provided configurations.
     """
 
@@ -36,8 +49,19 @@ class Trainer:
         optim_cfg: OptimConfig,
         sched_cfg: SchedulerConfig,
         # From optimizers.py
-        optimizer: Optimizer,
-        scheduler,
+        optimizer: Callable[
+            [
+                list[torch.nn.Parameter],
+                str,
+                float,
+                float,
+                tuple[float, float],
+                float,
+                float,
+            ],
+            Optimizer,
+        ],
+        scheduler: SchedulerFactory,
     ) -> None:
         """
         Wraps model, decoders (as a ModuleDict), optimizer/scheduler into one object.
@@ -72,6 +96,16 @@ class Trainer:
             sched_cfg.T_max,
         )
         self.train_cfg = train_cfg
+        self.device = torch.device(train_cfg.device)
+
+    def to(self, device: torch.device) -> None:
+        """Move the model and all decoder modules to the requested device."""
+
+        self.device = device
+        self.model.to(device)
+        self.decoders.to(device)
+        self.model.train()
+        self.decoders.train()
 
     def __dec(self, relations: edge_type):
         """Helper function to get the decoder for a given relation."""
@@ -84,14 +118,10 @@ class Trainer:
         else:
             return sum(loss_history[-k:]) / k
 
-    def train(self, loader: DataLoader):
+    def train(self, loader: DataLoader) -> float:
         # Set reproducibility and device
         torch.manual_seed(self.train_cfg.seed)
-        device = torch.device(self.train_cfg.device)
-        self.model.to(device)
-        for decoder_module in self.decoders.values():
-            decoder_module.to(device)
-            decoder_module.train()
+        self.to(self.device)
 
         lost_history = []
         best_loss = float("inf")
@@ -107,39 +137,36 @@ class Trainer:
         # Training loop
         while epoch < self.train_cfg.max_epochs and best_loss > target_loss:
             for batch in loader:
-                batch = batch.to(device)
+                batch = batch.to(self.device)
                 self.model.train()
                 self.opt.zero_grad()
 
                 #  Collect edge attributes and node features from DataLoader batch
                 edge_attr_dict = {
-                    relation: batch[relation].edge_attr.to(device)
-                    for relation in batch.edge_types
+                    relation: batch[relation].edge_attr for relation in batch.edge_types
                 }
 
-                x_dict = {
-                    node_type: x.to(device) for node_type, x in batch.x_dict.items()
-                }
+                x_dict = {node_type: x for node_type, x in batch.x_dict.items()}
                 edge_index_dict = {
-                    relation: edge_index.to(device)
+                    relation: edge_index
                     for relation, edge_index in batch.edge_index_dict.items()
                 }
 
                 # Forward pass through the GNN to update the node embeddings
                 node_embeddings = self.model(x_dict, edge_index_dict, edge_attr_dict)
 
-                total_loss = torch.tensor(0.0, device=device)
+                total_loss = torch.tensor(0.0, device=self.device)
                 for relation in self.train_cfg.relations:
                     src_node_type, _, dst_node_type = relation
                     all_edge_index = batch[relation].edge_index
-                    pos_edge_index = batch[relation].y.to(device)
+                    pos_edge_index = batch[relation].y.to(self.device)
 
                     relation_loss = bce_with_ground_truth(
                         self.__dec(relation),
                         node_embeddings[src_node_type],
                         node_embeddings[dst_node_type],
                         all_edge_index,
-                        targets=batch[relation].bce_loss_target.to(device),
+                        targets=batch[relation].bce_loss_target.to(self.device),
                     )
 
                     # Regularization to limit number of links per source node
@@ -183,120 +210,37 @@ class Trainer:
             pbar.refresh()
 
             # Step the scheduler if applicable
-            if self.sched and self.sched.__class__.__name__ != "ReduceLROnPlateau":
+            if self.sched and not isinstance(self.sched, ReduceLROnPlateau):
                 self.sched.step()
-        if self.sched and self.sched.__class__.__name__ == "ReduceLROnPlateau":
-            self.sched.step(total_loss.detach())
+        if self.sched and isinstance(self.sched, ReduceLROnPlateau):
+            self.sched.step(float(total_loss.detach().item()))
 
         epoch += 1
 
         return total_loss.item()
 
-    @torch.no_grad()
-    def all_pairs_scores_batched(
+    def save_checkpoint(self, path: str) -> None:
+        """Persist the encoder and decoder weights to disk."""
+
+        checkpoint = {
+            "encoder": self.model.state_dict(),
+            "decoder": {
+                relation: self.decoders[str(relation)].state_dict()
+                for relation in self.train_cfg.relations
+            },
+        }
+        torch.save(checkpoint, path)
+
+    def load_checkpoint(
         self,
-        src_node_embeddings: torch.Tensor,
-        dst_node_embeddings: torch.Tensor,
-        src_batch: torch.Tensor,
-        dst_batch: torch.Tensor,
-        edge_decoder,
-    ):
-        """
-        Per-blueprint all-pairs scores inside a hetero mini-batch.
-        Returns a dict[g] with local edge_index, probs, and local→global maps.
-        """
-        device = src_node_embeddings.device
-        out = {}
+        path: str,
+        map_location: Optional[Union[str, torch.device]] = None,
+    ) -> None:
+        """Load encoder and decoder weights from a checkpoint file."""
 
-        # iterate only over graphs present in both endpoints
-        g_src = torch.unique(src_batch)
-        g_dst = torch.unique(dst_batch)
-        g_common = [int(g) for g in g_src.tolist() if (dst_batch == g).any()]
-
-        for g in g_common:
-            src_keep = (src_batch == g).nonzero(as_tuple=False).view(-1)
-            dst_keep = (dst_batch == g).nonzero(as_tuple=False).view(-1)
-            if src_keep.numel() == 0 or dst_keep.numel() == 0:
-                continue
-
-            s_emb = src_node_embeddings[src_keep]
-            d_emb = dst_node_embeddings[dst_keep]
-
-            s_ids = torch.arange(s_emb.size(0), device=device)
-            d_ids = torch.arange(d_emb.size(0), device=device)
-            edge_index = torch.stack(
-                torch.meshgrid(s_ids, d_ids, indexing="ij"), dim=0
-            ).view(2, -1)
-
-            logits = edge_decoder(s_emb, d_emb, edge_index)
-            probs = torch.sigmoid(logits)
-
-            out[g] = {
-                "edge_index_local": edge_index,  # [2, S*D] local ids
-                "probs": probs,  # [S*D]
-                "src_local_to_global": src_keep,  # map back to batch-global
-                "dst_local_to_global": dst_keep,
-            }
-        return out
-
-    @torch.no_grad()
-    def best_pairs_batched(
-        self,
-        src_h: torch.Tensor,
-        dst_h: torch.Tensor,
-        src_batch: torch.Tensor,
-        dst_batch: torch.Tensor,
-        decoder,
-    ):
-        """
-        Argmax per source within each blueprint.
-        Returns: { graph_id: {src_global: (dst_global, prob)} }
-        """
-        ap = self.all_pairs_scores_batched(src_h, dst_h, src_batch, dst_batch, decoder)
-        result: dict[int, dict[int, tuple[int, float]]] = {}
-
-        for g, payload in ap.items():
-            probs = payload["probs"]
-            S = payload["src_local_to_global"].numel()
-            D = payload["dst_local_to_global"].numel()
-            P = probs.view(S, D)
-
-            best_prob, best_dst_local = P.max(dim=1)
-            src_gl = payload["src_local_to_global"]
-            dst_gl = payload["dst_local_to_global"][best_dst_local]
-
-            result[g] = {
-                int(src_gl[i]): (int(dst_gl[i]), float(best_prob[i])) for i in range(S)
-            }
-        return result
-
-    @torch.no_grad()
-    def pairs_above_threshold_batched(
-        self,
-        src_h: torch.Tensor,
-        dst_h: torch.Tensor,
-        src_batch: torch.Tensor,
-        dst_batch: torch.Tensor,
-        decoder,
-        threshold: float = 0.9,
-    ):
-        """Return all source/destination pairs whose probability exceeds ``threshold``."""
-
-        all_pairs = self.all_pairs_scores_batched(
-            src_h, dst_h, src_batch, dst_batch, decoder
-        )
-        filtered: dict[int, list[tuple[int, int, float]]] = {}
-
-        for graph_id, payload in all_pairs.items():
-            probs = payload["probs"]
-            keep = probs >= threshold
-            if keep.any():
-                local_edge_index = payload["edge_index_local"][:, keep]
-                src_global = payload["src_local_to_global"][local_edge_index[0]]
-                dst_global = payload["dst_local_to_global"][local_edge_index[1]]
-                filtered[graph_id] = [
-                    (int(src.item()), int(dst.item()), float(prob.item()))
-                    for src, dst, prob in zip(src_global, dst_global, probs[keep])
-                ]
-
-        return filtered
+        checkpoint = torch.load(path, map_location=map_location)
+        self.model.load_state_dict(checkpoint["encoder"])
+        for relation in self.train_cfg.relations:
+            self.decoders[str(relation)].load_state_dict(
+                checkpoint["decoder"][relation]
+            )

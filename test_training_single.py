@@ -17,6 +17,7 @@ from hetero_gine import HeteroGINE
 from decoders import build_decoder
 from optimizers import make_optimizer, make_scheduler
 from trainer import Trainer
+from predictor import Predictor, build_predictor
 
 edge_type = tuple[str, str, str]
 
@@ -88,7 +89,7 @@ def create_dummy_graph() -> HeteroData:
     return d
 
 
-def build_trainer() -> tuple[Trainer, torch.utils.data.DataLoader]:
+def build_trainer() -> Trainer:
 
     model_cfg = ModelConfig(
         node_feature_dimensions={"building": 6, "dline": 6, "name": 6}
@@ -140,24 +141,14 @@ def build_trainer() -> tuple[Trainer, torch.utils.data.DataLoader]:
 
 
 def inference(
-    trainer: Trainer,
+    predictor: Predictor,
     loader: torch.utils.data.DataLoader,
+    relations: list[edge_type],
     threshold: float = 0.9,
 ) -> None:
 
-    batch = next(iter(loader)).to(trainer.train_cfg.device)
-
-    trainer.model.to(trainer.train_cfg.device)
-    for decoder in trainer.decoders.values():
-        decoder.to(trainer.train_cfg.device)
-
-    trainer.model.eval()
-    with torch.no_grad():
-        edge_attr_dict = {
-            relation: batch[relation].edge_attr
-            for relation in trainer.train_cfg.relations
-        }
-        embeddings = trainer.model(batch.x_dict, batch.edge_index_dict, edge_attr_dict)
+    batch = next(iter(loader))
+    embeddings, batch = predictor.encode_batch(batch)
 
     relation_descriptions = {
         ("building", "x_link", "dline"): (
@@ -177,18 +168,18 @@ def inference(
         ),
     }
 
-    for relation in trainer.train_cfg.relations:
+    for relation in relations:
         src_type, _, dst_type = relation
         src_batch = batch[src_type].batch
         dst_batch = batch[dst_type].batch
-        decoder = trainer.decoders[str(relation)]
+        decoder = predictor.decoders[str(relation)]
 
-        predictions = trainer.pairs_above_threshold_batched(
+        predictions = predictor.pairs_above_threshold_batched(
             embeddings[src_type],
             embeddings[dst_type],
             src_batch,
             dst_batch,
-            decoder,
+            relation,
             threshold,
         )
 
@@ -210,31 +201,19 @@ def main() -> None:
     loader = build_loader([graph], batch_size=1, shuffle=True)
     loss = trainer.train(loader)
     print(f"Training completed loss: {loss:.4f}")
-    inference(trainer, loader, threshold=0.9)
+    predictor = build_predictor(trainer)
+    inference(predictor, loader, RELATIONS, threshold=0.9)
 
     # Save the model and decoder state_dicts
-    torch.save(
-        {
-            "encoder": trainer.model.state_dict(),
-            "decoder": {
-                relation: trainer.decoders[str(relation)].state_dict()
-                for relation in RELATIONS
-            },
-        },
-        "model_and_decoders.pth",
-    )
+    trainer.save_checkpoint("model_and_decoders.pth")
     print("\nModel and decoders saved to 'model_and_decoders.pth'.")
 
     # Try loading the model and decoder state_dicts into a new Trainer instance
     new_trainer = build_trainer()
-    checkpoint = torch.load("model_and_decoders.pth", map_location=DEVICE)
-    new_trainer.model.load_state_dict(checkpoint["encoder"])
-    for relation in RELATIONS:
-        new_trainer.decoders[str(relation)].load_state_dict(
-            checkpoint["decoder"][relation]
-        )
+    new_trainer.load_checkpoint("model_and_decoders.pth", map_location=DEVICE)
+    new_predictor = build_predictor(new_trainer, device=DEVICE)
     print("\nModel and decoders successfully loaded into a new Trainer instance.")
-    inference(new_trainer, loader, threshold=0.9)
+    inference(new_predictor, loader, RELATIONS, threshold=0.9)
 
 
 if __name__ == "__main__":
